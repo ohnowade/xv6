@@ -5,6 +5,7 @@
 #include "mmu.h"
 #include "proc.h"
 #include "sysfunc.h"
+#include "pstat.h"
 
 int
 sys_fork(void)
@@ -88,3 +89,22 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+// Get status of all processes
+int 
+sys_getprocinfo(void) 
+{
+  int addr;
+
+  if (argint(0, &addr) < 0) return -1;
+
+  return getprocinfo((struct pstat*)addr);
+}
+
+// Boost up current user process
+int
+sys_boostproc(void)
+{
+  return boostproc();
+}
+

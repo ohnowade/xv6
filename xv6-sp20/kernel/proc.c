@@ -5,6 +5,7 @@
 #include "x86.h"
 #include "proc.h"
 #include "spinlock.h"
+#include "pstat.h"
 
 struct {
   struct spinlock lock;
@@ -12,6 +13,16 @@ struct {
 } ptable;
 
 static struct proc *initproc;
+
+// the multi level feedback queue used for scheduler
+struct {
+    // the queues storing addresses of all processes
+    struct proc *queue[4][NPROC];
+    // the number of ticks of each
+    int tick_cnt[4][NPROC];
+    // the size of each queue
+    int qsize[4];
+} mlfq;
 
 int nextpid = 1;
 extern void forkret(void);
@@ -23,6 +34,153 @@ void
 pinit(void)
 {
   initlock(&ptable.lock, "ptable");
+}
+
+// Initialize the mlfq
+void 
+init_mlfq(void) 
+{
+  for (int i = 0; i < 4; i++) {
+    for (int j = 0; j < NPROC; j++) mlfq.queue[i][j] = 0;
+    mlfq.qsize[i] = 0;
+  }
+}
+
+// Update the time slice of the process
+void 
+q_update_timeslice(struct proc *p) 
+{
+  if (p->priority == 3) {
+    p->single_time_slice = 8;
+    p->rr_time_slice = 1;
+  } else if (p->priority == 2) {
+    p->single_time_slice = 16;
+    p->rr_time_slice = 2;
+  } else if (p->priority == 1) {
+    p->single_time_slice = 32;
+    p->rr_time_slice = 4;
+  } else {
+    p->single_time_slice = 0;
+    p->rr_time_slice = 64;
+  }
+}
+
+// Add a new process to the MLFQ when it is created
+void 
+q_add_proc(struct proc *p) 
+{
+  mlfq.queue[3][mlfq.qsize[3]++] = p;
+
+  p->ticks = 0;
+  p->rr_ticks = 0;
+  for (int i = 0; i < 3; i++) p->total_ticks[i] = 0;
+  for (int i = 0; i < 3; i++) p->wait[i] = 0;
+  p->priority = 3;
+  q_update_timeslice(p);
+}
+
+// Remove a process from its current level
+void 
+q_remove_proc(struct proc *p) 
+{
+  for (int i = 0; i < mlfq.qsize[p->priority]; i++) {
+    if (mlfq.queue[p->priority][i] == p) {
+      // move forward all processes after the found one
+      for (int j = i; j < mlfq.qsize[p->priority] - 1; j++) 
+        mlfq.queue[p->priority][j] = mlfq.queue[p->priority][j + 1];
+
+      // remove the process from the queue and update size
+      mlfq.queue[p->priority][mlfq.qsize[p->priority] - 1] = 0;
+      mlfq.qsize[p->priority]--;
+      return;
+    }
+  }
+}
+
+// Downgrade a process. It does nothing if process is on the lowest level
+void 
+q_downgrade_proc(struct proc *p) 
+{
+  if (p->priority == 0) return;
+
+  // Add process to the tail of the queue at lower level
+  mlfq.queue[p->priority - 1][mlfq.qsize[p->priority - 1]++] = p;
+  // Remove process from current level
+  q_remove_proc(p);
+  p->wait[p->priority] = 0;
+  p->priority--;
+  p->ticks = 0;
+  p->rr_ticks = 0;
+  p->wait[p->priority] = 0;
+  q_update_timeslice(p);
+}
+
+// Boost up a process to prevent starvation
+void
+q_boost_proc(struct proc* p)
+{
+  if (p->priority < 3) {
+    q_remove_proc(p);
+    p->wait[(p->priority)++] = 0;
+    mlfq.queue[p->priority][(mlfq.qsize[p->priority])++] = p;
+    q_update_timeslice(p);
+    p->wait[p->priority] = 0;
+    p->ticks = 0;
+    p->rr_ticks = 0;
+  }
+}
+
+// Update wait ticks of all other RUNNABLE processes except for p.
+// Boost up processes if needed
+void 
+q_wait_proc(struct proc *p) 
+{
+  for (int i = 3; i >= 0; i--) {
+    for (int j = 0; j < mlfq.qsize[i]; j++) {
+      struct proc *cur_p = mlfq.queue[i][j];
+
+      if (cur_p != p && cur_p->state == RUNNABLE) cur_p->wait[i]++;
+    }
+  }
+}
+
+void
+q_boost_all(void)
+{
+  for (int i = 3; i >= 0; i--) {
+    int j = 0;
+
+    while(j < mlfq.qsize[i]) {
+      struct proc *cur_p = mlfq.queue[i][j];
+
+      int wait_t = (i == 0) ? 640 : (10 * cur_p->single_time_slice);
+      
+      if (cur_p->wait[cur_p->priority] >= wait_t) {
+        q_boost_proc(cur_p);       
+        continue;
+      }
+
+      j++;
+    }
+  }
+}
+
+// Move the process to the end of its queue
+void 
+q_move_back_proc(struct proc *p) 
+{
+  for (int i = 0; i < mlfq.qsize[p->priority]; i++) {
+    if (mlfq.queue[p->priority][i] == p) {
+      // move forward all processes after the found one
+      for (int j = i; j < mlfq.qsize[p->priority] - 1; j++) 
+        mlfq.queue[p->priority][j] = mlfq.queue[p->priority][j + 1];
+
+      mlfq.queue[p->priority][mlfq.qsize[p->priority] - 1] = p;
+      p->rr_ticks = 0;
+
+      return;
+    }
+  }
 }
 
 // Look in the process table for an UNUSED proc.
@@ -98,6 +256,7 @@ userinit(void)
   p->cwd = namei("/");
 
   p->state = RUNNABLE;
+  q_add_proc(p); // add first user process to the queue
   release(&ptable.lock);
 }
 
@@ -155,6 +314,7 @@ fork(void)
  
   pid = np->pid;
   np->state = RUNNABLE;
+  q_add_proc(np);
   safestrcpy(np->name, proc->name, sizeof(proc->name));
   return pid;
 }
@@ -198,6 +358,8 @@ exit(void)
 
   // Jump into the scheduler, never to return.
   proc->state = ZOMBIE;
+  q_remove_proc(proc);  // remove the process from mlfq
+  //cprintf("process %d is removed\n", p->pid);
   sched();
   panic("zombie exit");
 }
@@ -261,27 +423,52 @@ scheduler(void)
     // Enable interrupts on this processor.
     sti();
 
-    // Loop over process table looking for process to run.
+    // Loop over MLFQ looking for process to run.
     acquire(&ptable.lock);
-    for(p = ptable.proc; p < &ptable.proc[NPROC]; p++){
-      if(p->state != RUNNABLE)
+    
+    q_boost_all();
+
+    for (int i = 3; i >= 0; i--) {
+      if (mlfq.qsize[i] == 0) {
         continue;
+      }
+      
+      for (int j = 0; j < mlfq.qsize[i]; j++) {
+        p = mlfq.queue[i][j];
 
-      // Switch to chosen process.  It is the process's job
-      // to release ptable.lock and then reacquire it
-      // before jumping back to us.
-      proc = p;
-      switchuvm(p);
-      p->state = RUNNING;
-      swtch(&cpu->scheduler, proc->context);
-      switchkvm();
-
-      // Process is done running for now.
-      // It should have changed its p->state before coming back.
-      proc = 0;
+        if (p->state != RUNNABLE) continue;
+      
+        p->ticks++;
+        p->rr_ticks++;
+        p->total_ticks[p->priority]++;
+        p->wait[p->priority] = 0;         
+        q_wait_proc(p);
+        
+        if (i != 0 && p->ticks >= p->single_time_slice) { 
+          q_downgrade_proc(p);
+        } else if (p->rr_ticks >= p->rr_time_slice) {
+          q_move_back_proc(p);
+        }
+        
+        goto run;
+      }
     }
-    release(&ptable.lock);
 
+  run:
+    // Switch to chosen process.  It is the process's
+    // job to release ptable.lock and then reacquire it
+    // before jumping back to us.
+    proc = p;
+    switchuvm(p);
+    p->state = RUNNING;
+    swtch(&cpu->scheduler, proc->context);
+    switchkvm();
+
+    // Process is done running for now.
+    // It should have changed its p->state before coming
+    // back.
+    proc = 0;
+    release(&ptable.lock);
   }
 }
 
@@ -441,6 +628,41 @@ procdump(void)
     }
     cprintf("\n");
   }
+}
+
+// Extract useful information for each process
+int 
+getprocinfo(struct pstat *stats) 
+{
+  if (stats == 0) return -1;
+
+  struct proc *p;
+
+  for (p = ptable.proc; p < &ptable.proc[NPROC]; p++) {
+    // the process's index in ptable
+    int pindex = p - &ptable.proc[0];
+
+    if (p->state != UNUSED) {
+      stats->inuse[pindex] = 1;
+      stats->pid[pindex] = p->pid;
+      stats->state[pindex] = p->state;
+      stats->priority[pindex] = p->priority;
+      for (int i = 0; i < 4; i++) stats->ticks[pindex][i] = p->total_ticks[i];
+      for (int i = 0; i < 4; i++) stats->wait_ticks[pindex][i] = p->wait[i];
+    } else {
+      stats->inuse[pindex] = 0;
+    }
+  }
+
+  return 0;
+}
+
+// Boost up current process one level up if it is not in priority 3
+int
+boostproc(void)
+{
+  if (proc->priority < 3) q_boost_proc(proc);
+  return 0;
 }
 
 
